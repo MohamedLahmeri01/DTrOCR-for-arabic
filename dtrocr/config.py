@@ -4,7 +4,7 @@ from typing import Optional, Union, Tuple, List, Literal
 class DTrOCRConfig:
     def __init__(
         self,
-        gpt2_hf_model: str = 'openai-community/gpt2',
+        gpt2_hf_model: str = 'akhooli/gpt2-small-arabic',
         vit_hf_model: str = 'google/vit-base-patch16-224',
         vocab_size: Optional[int] = 50257,
         max_position_embeddings: Optional[int] = 256,

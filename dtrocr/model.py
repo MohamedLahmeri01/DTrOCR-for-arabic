@@ -6,9 +6,10 @@ from config import DTrOCRConfig
 from processor import DTrOCRProcessor
 from data import DTrOCRLMHeadModelOutput, DTrOCRModelOutput, DTrOCRProcessorOutput
 
+from arabert.aragpt2.grover.modeling_gpt2 import GPT2Block, GPT2Model
+
 from transformers.models.vit.modeling_vit import ViTPatchEmbeddings
 from transformers.generation.logits_process import LogitsProcessorList
-from transformers.models.gpt2.modeling_gpt2 import GPT2Block, GPT2Model
 from transformers.generation.configuration_utils import GenerationConfig
 from transformers.modeling_attn_mask_utils import _prepare_4d_causal_attention_mask_for_sdpa
 from transformers.generation.beam_search import BeamScorer, BeamSearchScorer
@@ -133,53 +134,63 @@ class DTrOCRLMHeadModel(nn.Module):
         super().__init__()
         self.config = config
 
-        # Initialize Arabic tokenizer
-        self.tokenizer = BertTokenizer.from_pretrained('asafaya/bert-base-arabic')
-        
-        # Initialize BERT model
-        self.bert_model = BertModel.from_pretrained('asafaya/bert-base-arabic')
-        
-        # Language modeling head
+        self.transformer = DTrOCRModel(config)
         self.language_model_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
-        
-        # Calculate image embedding length
+
         image_size, patch_size = config.image_size, config.patch_size
         self.image_embedding_length = int((image_size[0] / patch_size[0]) * (image_size[1] / patch_size[1]))
 
     def forward(
-        self,
-        pixel_values: torch.Tensor,
-        input_text: List[str],
-        labels: Optional[torch.LongTensor] = None,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
-        # Tokenize input text
-        encoded_inputs = self.tokenizer(input_text, return_tensors='pt', padding=True, truncation=True)
+            self,
+            pixel_values: torch.Tensor,
+            input_ids: torch.LongTensor,
+            past_key_values: Optional[Tuple[Tuple[torch.Tensor]]] = None,
+            position_ids: Optional[torch.LongTensor] = None,
+            attention_mask: Optional[torch.Tensor] = None,
+            use_cache: Optional[bool] = False,
+            labels: Optional[torch.LongTensor] = None,
+    ) -> DTrOCRLMHeadModelOutput:
+        transformer_output = self.transformer(
+            pixel_values=pixel_values,
+            input_ids=input_ids,
+            past_key_values=past_key_values,
+            position_ids=position_ids,
+            attention_mask=attention_mask,
+            use_cache=use_cache
+        )
+        logits = self.language_model_head(transformer_output.hidden_states)
 
-        # Pass through BERT model
-        outputs = self.bert_model(**encoded_inputs)
-
-        # Extract hidden states from BERT output
-        hidden_states = outputs.last_hidden_state  # Shape: (batch_size, seq_length, hidden_size)
-
-        # Compute logits for language modeling head
-        logits = self.language_model_head(hidden_states)  # Shape: (batch_size, seq_length, config.vocab_size)
-
-        # Compute loss and accuracy if labels are provided
         loss, accuracy = None, None
         if labels is not None:
-            # Calculate cross-entropy loss
-            loss_fct = nn.CrossEntropyLoss()
-            active_loss = labels.view(-1) != -100  # Ignore masked tokens
-            active_logits = logits.view(-1, self.config.vocab_size)[active_loss]
-            active_labels = labels.view(-1)[active_loss]
-            loss = loss_fct(active_logits, active_labels)
+            labels = labels.to(logits.device)
 
-            # Calculate accuracy
-            predictions = torch.argmax(logits, dim=-1)
-            correct_predictions = torch.sum(predictions == labels)
-            accuracy = correct_predictions.float() / labels.numel()
+            # Shift so that tokens < n predict n
+            shift_logits = logits[..., self.image_embedding_length:-1, :].contiguous()
+            shift_labels = labels[..., 1:].contiguous()
 
-        return logits, loss, accuracy
+            loss_fct = nn.CrossEntropyLoss(reduction="none")
+            loss = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
+
+            label_matches = shift_labels.view(-1) == torch.argmax(
+                torch.nn.functional.softmax(shift_logits.view(-1, shift_logits.size(-1)), dim=-1), dim=-1
+            )
+
+            # reduce loss
+            if attention_mask is not None:
+                mask = attention_mask[..., 1:].reshape(-1)
+
+                loss = (mask * loss).sum() / mask.sum()
+                accuracy = (mask * label_matches).sum() / mask.sum()
+            else:
+                loss = loss.mean()
+                accuracy = torch.sum(label_matches) / label_matches.shape[0]
+
+        return DTrOCRLMHeadModelOutput(
+            loss=loss,
+            logits=logits,
+            accuracy=accuracy,
+            past_key_values=transformer_output.past_key_values
+        )
 
     @torch.no_grad()
     def generate(
